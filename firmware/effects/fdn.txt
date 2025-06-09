@@ -1,0 +1,276 @@
+#pragma once
+#include <math.h>
+#include <string.h>
+
+#define FDN_SIZE 4
+#define MAX_DELAY_SAMPLES 48000/8  // 1 second at 48kHz
+
+#define FDN_ALLPASS_COUNT 4
+static const float FDN_ALLPASS_DELAYS_S[FDN_ALLPASS_COUNT] = {0.013f, 0.023f, 0.037f, 0.019f};
+
+typedef struct {
+    float* delay_lines[FDN_SIZE];
+    size_t delay_lengths[FDN_SIZE];
+    size_t write_pos[FDN_SIZE];
+    float feedback_gain;
+    float input_gains[FDN_SIZE];
+    float output_gains[FDN_SIZE];
+    size_t sample_rate;
+    biquad_t filters[FDN_SIZE][3];  // Add filters to eliminate resonances form the feedback
+    float damping;                  // Add damping parameterz
+    // allpass_t allpass[FDN_ALLPASS_COUNT];
+
+    float current_delays[FDN_SIZE];
+    float target_delays[FDN_SIZE];
+    float delay_slew_rate;
+
+    // noise_t noise[FDN_SIZE];
+
+    // biquad_t bass_filter;
+    // biquad_t high_filter;
+} fdn_t;
+
+// static const float PRIME_DELAYS_MS[] = {19.3f, 23.7f, 29.1f, 31.3f, 37.1f, 41.3f, 43.7f, 47.3f};
+// static const float PRIME_DELAYS_MS[] = {17.3f, 25.9f, 31.7f, 35.1f, 42.3f, 46.9f, 52.7f, 59.1f};
+// static const float PRIME_DELAYS_MS[] = {13.7f, 19.2f, 26.9f, 37.6f, 45.3f, 54.8f, 66.1f, 79.7f};
+static const float PRIME_DELAYS_MS[] = {13.7f, 19.2f, 26.9f, 37.6f};    
+void hadamard_transform(float* buffer, int size) {
+    for (int step = 1; step < size; step <<= 1) {
+        for (int i = 0; i < size; i += 2 * step) {
+            for (int j = i; j < i + step; j++) {
+                float a = buffer[j];
+                float b = buffer[j + step];
+                buffer[j] = a + b;
+                buffer[j + step] = a - b;
+            }
+        }
+    }
+
+    // Normalize
+    float norm = 1.0f / sqrtf(size);
+    for (int i = 0; i < size; i++) {
+        buffer[i] *= norm;
+    }
+}
+static const float HADAMARD_NORM = 0.3535533905932738f; // 1/sqrt(8) precomputed
+
+// void hadamard_transform_8(float* buffer) {
+//     float a0, a1, a2, a3, a4, a5, a6, a7;
+//     float b0, b1, b2, b3, b4, b5, b6, b7;
+    
+//     // Load values
+//     a0 = buffer[0]; a1 = buffer[1];
+//     a2 = buffer[2]; a3 = buffer[3];
+//     a4 = buffer[4]; a5 = buffer[5];
+//     a6 = buffer[6]; a7 = buffer[7];
+
+//     // Stage 1
+//     b0 = a0 + a1; b1 = a0 - a1;
+//     b2 = a2 + a3; b3 = a2 - a3;
+//     b4 = a4 + a5; b5 = a4 - a5;
+//     b6 = a6 + a7; b7 = a6 - a7;
+
+//     // Stage 2
+//     a0 = b0 + b2; a1 = b1 + b3;
+//     a2 = b0 - b2; a3 = b1 - b3;
+//     a4 = b4 + b6; a5 = b5 + b7;
+//     a6 = b4 - b6; a7 = b5 - b7;
+
+//     // Stage 3 and normalize
+//     buffer[0] = (a0 + a4) * HADAMARD_NORM;
+//     buffer[1] = (a1 + a5) * HADAMARD_NORM;
+//     buffer[2] = (a2 + a6) * HADAMARD_NORM;
+//     buffer[3] = (a3 + a7) * HADAMARD_NORM;
+//     buffer[4] = (a0 - a4) * HADAMARD_NORM;
+//     buffer[5] = (a1 - a5) * HADAMARD_NORM;
+//     buffer[6] = (a2 - a6) * HADAMARD_NORM;
+//     buffer[7] = (a3 - a7) * HADAMARD_NORM;
+// }
+static const float HADAMARD_NORM_4 = 0.5f; // 1/sqrt(4)
+
+void hadamard_transform_4(float* buffer) {
+    float a0 = buffer[0], a1 = buffer[1];
+    float a2 = buffer[2], a3 = buffer[3];
+    
+    buffer[0] = (a0 + a1 + a2 + a3) * HADAMARD_NORM_4;
+    buffer[1] = (a0 + a1 - a2 - a3) * HADAMARD_NORM_4;
+    buffer[2] = (a0 - a1 + a2 - a3) * HADAMARD_NORM_4;
+    buffer[3] = (a0 - a1 - a2 + a3) * HADAMARD_NORM_4;
+}
+void fdn_init(fdn_t* fdn, size_t sample_rate) {
+    fdn->sample_rate = sample_rate;
+    fdn->damping = 1.0f;  // Full brightness initially
+
+    // biquad_init(&fdn->bass_filter, FILTER_HIGHPASS, 100, 0.707f, 1, sample_rate);
+    // biquad_init(&fdn->high_filter, FILTER_LOWPASS, 18000, 0.707f, 1, sample_rate);
+
+    // Initialize delay lines and filters
+    for (int i = 0; i < FDN_SIZE; i++) {
+        fdn->delay_lines[i] = (float*)allocate(MAX_DELAY_SAMPLES * sizeof(float));
+        fdn->delay_lengths[i] = (size_t)(PRIME_DELAYS_MS[i] * sample_rate / 1000.0f);
+        fdn->write_pos[i] = 0;
+
+        for (int j = 0; j < 3; j++) {
+            float freq = 20000.0f * (1.0f - (j * 0.2f));  // Spread frequencies
+            biquad_init(&fdn->filters[i][j], FILTER_LOWPASS, freq, 0.5f, 1, sample_rate);
+        }
+    }
+
+    // Higher initial feedback for longer decay
+    fdn->feedback_gain = 0.97f;
+
+    // Alternating input gains
+    for (int i = 0; i < FDN_SIZE; i++) {
+        fdn->input_gains[i] = (i % 2 == 0) ? 0.7f : -0.7f;
+    }
+
+    // Output gains with progressive scaling
+    for (int i = 0; i < FDN_SIZE; i++) {
+        float scale = 1.0f - (i / (float)FDN_SIZE) * 0.3f;
+        fdn->output_gains[i] = scale * 0.5f;
+    }
+
+    // // Initialize noise
+    // for (int i = 0; i < FDN_SIZE; i++) {
+    //     noise_init(&fdn->noise[i], sample_rate);
+    //     noise_set_frequency(&fdn->noise[i], 25);
+    //     noise_set_step_size(&fdn->noise[i], 0.1f);
+    //     fdn->delay_slew_rate = 0.001f;
+    // }
+
+    // for (int i = 0; i < FDN_ALLPASS_COUNT; i++) {
+    //     allpass_init(&fdn->allpass[i], sample_rate);
+    //     allpass_set_delay(&fdn->allpass[i], FDN_ALLPASS_DELAYS_S[i], sample_rate);
+    //     allpass_set_feedback(&fdn->allpass[i], 0.5f);
+    // }
+}
+
+float fdn_process(fdn_t* fdn, float input) {
+    float delay_outputs[FDN_SIZE];
+    float mixed[FDN_SIZE];
+    float output = 0.0f;
+
+    // Direct read from delay lines, no modulation
+    for (int i = 0; i < FDN_SIZE; i++) {
+        size_t read_pos = fdn->write_pos[i] - fdn->delay_lengths[i];
+        if (read_pos < 0) read_pos += fdn->delay_lengths[i];
+        delay_outputs[i] = fdn->delay_lines[i][read_pos];
+        mixed[i] = delay_outputs[i] + (input * fdn->input_gains[i]);
+    }
+
+    hadamard_transform_4(mixed);
+
+    // Single feedback filter instead of chain of 3
+    for (int i = 0; i < FDN_SIZE; i++) {
+        float feedback = mixed[i] * fdn->feedback_gain;
+        feedback = biquad_process(&fdn->filters[i][0], feedback);
+        fdn->delay_lines[i][fdn->write_pos[i]] = feedback;
+        fdn->write_pos[i] = (fdn->write_pos[i] + 1) % fdn->delay_lengths[i];
+        output += delay_outputs[i] * fdn->output_gains[i];
+    }
+
+    output *= 0.5f;
+    return fminf(1.0f, fmaxf(-1.0f, output));
+    // return tanhf(output);
+}
+
+// float fdn_process(fdn_t* fdn, float input) {
+//     float delay_outputs[FDN_SIZE];
+//     float mixed[FDN_SIZE];
+//     float output = 0.0f;
+
+//     for (int i = 0; i < FDN_SIZE; i++) {
+//         float base_delay = PRIME_DELAYS_MS[i] * fdn->sample_rate / 1000.0f;
+//         float mod_ms = noise_process(&fdn->noise[i]) * 10.0f;  // +/- 18ms
+//         float mod_samples = mod_ms * fdn->sample_rate / 1000.0f;
+//         fdn->target_delays[i] = fmaxf(1.0f, base_delay + mod_samples);
+//     }
+
+//     // Read from delay lines with modulation
+//     for (int i = 0; i < FDN_SIZE; i++) {
+//         // Slew limit delay changes
+//         float delay_delta = fdn->target_delays[i] - fdn->current_delays[i];
+//         fdn->current_delays[i] += delay_delta * fdn->delay_slew_rate;
+
+//         // Calculate read position
+//         float read_pos = fdn->write_pos[i] - fdn->current_delays[i];
+//         while (read_pos < 0)
+//             read_pos += fdn->delay_lengths[i];
+
+//         // Interpolated read
+//         int read_pos_int = (int)read_pos;
+//         float frac = read_pos - read_pos_int;
+//         int next_pos = (read_pos_int + 1) % fdn->delay_lengths[i];
+
+//         float s1 = fdn->delay_lines[i][read_pos_int];
+//         float s2 = fdn->delay_lines[i][next_pos];
+//         delay_outputs[i] = s1 + frac * (s2 - s1);
+//     }
+
+//     // // Mix input with delayed signals
+//     for (int i = 0; i < FDN_SIZE; i++) {
+//         mixed[i] = delay_outputs[i] + (input * fdn->input_gains[i]);
+//     }
+
+//     // Apply Hadamard matrix mixing
+
+//     // hadamard_transform(mixed, FDN_SIZE);
+//     hadamard_transform(mixed, FDN_SIZE);
+
+//     for (int i = 0; i < FDN_SIZE; i++) {
+//         float feedback = (mixed[i] * fdn->feedback_gain);
+//         // In process, replace filter line with:
+//         for (int j = 0; j < 3; j++) {
+//             feedback = biquad_process(&fdn->filters[i][j], feedback);
+//         }
+//         // Write to delay line
+//         fdn->delay_lines[i][fdn->write_pos[i]] = feedback;
+//         fdn->write_pos[i] = (fdn->write_pos[i] + 1) % fdn->delay_lengths[i];
+
+//         output += delay_outputs[i] * fdn->output_gains[i];
+//     }
+
+//     // Apply allpass filters
+//     for (int i = 0; i < FDN_ALLPASS_COUNT; i++) {
+//         // output = allpass_process(&fdn->allpass[i], output);
+//     }
+
+//     // output = biquad_process(&fdn->bass_filter, output);
+//     // output = biquad_process(&fdn->high_filter, output);
+
+//     return tanhf(output * 1);
+// }
+
+void fdn_set_damping(fdn_t* fdn, float damping) {
+    // fdn->damping = fmaxf(0.0f, fminf(damping, 1.0f));
+
+    // // Map damping 0-1 to frequency range 20000-2000 Hz
+    // float freq = 2000.0f + (18000.0f * (1.0f - fdn->damping));
+
+    // for (int i = 0; i < FDN_SIZE; i++) {
+    //     biquad_set_frequency(&fdn->filters[i][0], freq);
+    // }
+}
+
+void fdn_set_decay(fdn_t* fdn, float decay_seconds) {
+    // decay_seconds *= 1.2f;
+    // // Calculate based on average delay time
+    // float avg_delay_time = 0.0f;
+    // for (int i = 0; i < FDN_SIZE; i++) {
+    //     avg_delay_time += (float)fdn->delay_lengths[i] / fdn->sample_rate;
+    // }
+    // avg_delay_time /= FDN_SIZE;
+
+    // // RT60 decay calculation
+    // float feedback = powf(0.003f, (avg_delay_time / decay_seconds) * 0.5f);
+    // fdn->feedback_gain = fminf(fmaxf(feedback, 0.0f), 0.998f);
+    fdn->feedback_gain = 0.97f;
+}
+
+void fdn_set_modulation_rate(fdn_t* fdn, float rate) {
+    // rate = powf(rate, 2.0f);
+    // float step_size = 0.001f + (rate * 0.04f);  // Reduced step size range
+    // for (int i = 0; i < FDN_SIZE; i++) {
+    //     noise_set_step_size(&fdn->noise[i], step_size);
+    // }
+}

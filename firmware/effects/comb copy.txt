@@ -1,0 +1,57 @@
+#pragma once
+#include <math.h>
+#include <stdlib.h>
+#include "biquad.h"
+#include "../platform/circular_buffer.h"
+
+typedef struct {
+    circular_buffer_t buffer;
+    biquad_t filter;
+    float feedback_gain;    // feedback amount (how much of the delayed signal to mix with the input)
+    float filtered;        // previous output sample
+    int delay_samples;     // delay length in samples
+} comb_t;
+
+void comb_init(comb_t *c, size_t sample_rate) {
+    circular_buffer_init(&c->buffer, (size_t)(0.2f * sample_rate));
+    biquad_init(&c->filter, FILTER_LOWPASS, 8000, 0.707f, 1, sample_rate);
+    c->feedback_gain = 0.0f;
+    c->filtered = 0.0f;
+    c->delay_samples = (int)(0.1f * sample_rate); // 100ms default delay
+}
+
+float comb_process(comb_t *c, float input) {
+    // Calculate read position
+    int current_pos = c->buffer.write_pos;
+    int read_pos = current_pos - c->delay_samples;
+    if(read_pos < 0) read_pos += c->buffer.size;
+    
+    // Get delayed sample
+    float delayed = circular_buffer_read(&c->buffer, read_pos);
+    
+    // Apply lowpass filter to the feedback path
+    float filtered = biquad_process(&c->filter, delayed);
+    
+    // Write new value to buffer (input + filtered feedback)
+    circular_buffer_write(&c->buffer, input + (filtered * c->feedback_gain));
+    
+    return delayed;
+}
+
+// Set delay time in seconds
+void comb_set_delay(comb_t *c, float delay_time, float sample_rate) {
+    int new_delay = (int)(delay_time * sample_rate);
+    if(new_delay >= c->buffer.size) new_delay = c->buffer.size - 1;
+    if(new_delay < 0) new_delay = 0;
+    c->delay_samples = new_delay;
+}
+
+// Set feedback amount (0 to 1)
+void comb_set_feedback(comb_t *c, float feedback) {
+    c->feedback_gain = feedback;
+}
+
+// Set damping amount (0 to 1)
+void comb_set_damping(comb_t *c, float damping_freq) {
+    biquad_set_frequency(&c->filter, damping_freq);
+}

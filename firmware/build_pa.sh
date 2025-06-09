@@ -1,0 +1,1 @@
+gcc -Wall -Wextra test_pa.c `pkg-config --cflags --libs gtk4 portaudio-2.0` -lportaudio -lm -lfftw3f -o test_pa

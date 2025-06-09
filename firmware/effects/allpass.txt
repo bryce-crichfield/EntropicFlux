@@ -1,0 +1,54 @@
+#pragma once
+#include <math.h>
+#include <stdlib.h>
+#include "../platform/circular_buffer.h"
+
+typedef struct
+{
+    circular_buffer_t buffer;
+    float  gain;          // feedback coefficient
+    int    delay_samples; // delay length in samples
+} allpass_t;
+
+void allpass_init(allpass_t *ap, size_t sample_rate)
+{
+    circular_buffer_init(&ap->buffer, sample_rate);
+    
+    ap->gain = 0.0f;
+    ap->delay_samples = (int)(0.1f * sample_rate); // 100ms delay
+}
+
+float allpass_process(allpass_t *ap, float input)
+{
+    // Calculate read position
+    int current_pos = ap->buffer.write_pos;
+    int read_pos = current_pos - ap->delay_samples;
+    if(read_pos < 0)
+        read_pos += ap->buffer.size;
+
+    // Get delayed sample
+    float delayed = circular_buffer_read(&ap->buffer, read_pos);
+
+    // Calculate output
+    float output = delayed - (ap->gain * input);
+
+    // Update buffer
+    circular_buffer_write(&ap->buffer, input + (ap->gain * delayed));
+
+    return output;
+}
+
+void allpass_set_delay(allpass_t *ap, float delay_time, size_t sample_rate)
+{
+    int new_delay = (int)(delay_time * sample_rate);
+    if(new_delay >= ap->buffer.size)
+        new_delay = ap->buffer.size - 1;
+    if(new_delay < 0)
+        new_delay = 0;
+    ap->delay_samples = new_delay;
+}
+
+void allpass_set_feedback(allpass_t *ap, float feedback)
+{
+    ap->gain = feedback;
+}

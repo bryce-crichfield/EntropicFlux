@@ -1,0 +1,328 @@
+#include "daisy_seed.h"
+#include "daisysp.h"
+#define DAISY
+
+#include "Button.h"
+#include "delay_line.h"
+#include "effects/Vibrato.h"
+#include "effects/biquad.h"
+#include "effects/harmonizer.h"
+#include "util/Delay.h"
+#include "util/Potentiometer.h"
+#include "util/TapTempo.h"
+#include "util/DelayTimeController.h"
+
+using namespace daisy;
+using namespace daisysp;
+
+DaisySeed hw;
+
+#define LED_A 22
+#define LED_B 23
+
+#define POT1 16
+#define POT2 17
+#define POT3 18
+#define POT4 19
+#define POT5 20
+#define POT6 21
+
+#define S1 10
+#define S2 9
+#define S3 8
+#define S4 7
+
+#define FS1 26
+#define FS2 25
+
+
+DelayTimeController delayTimeController;
+Potentiometer vTime;
+Potentiometer vFeedback;
+Potentiometer vMix;
+Potentiometer vBass;
+Potentiometer vTreble;
+Potentiometer vDepth;
+
+Switch s1, s2, s3, s4;
+Button fs1;
+TapTempo tap_tempo;
+Led bypass_led, tempo_led;
+
+size_t rhythm = 0;
+size_t modulation = 0;
+bool isActivated = false;
+// bool isVibrato = false;
+
+
+Svf high_pass, low_pass;
+harmonizer_t harmonizer;
+
+Delay<float> delay_lines[5];
+Oscillator line_osc[5];
+biquad_t line_filters[5];
+
+Vibrato vibrato;
+Chorus chorus;
+Overdrive overdrive;
+
+inline float mix_signals(float dry, float wet, float mix) {
+    return (1.0f - mix) * dry + mix * wet;
+}
+
+// inline void UpdateRhythmTime() 
+// {
+//     // Calculate delay times for each tap based on the set rhythm
+//     for (size_t i = 0; i < 4; i++) {
+//         float multiplier;
+//         switch (rhythm) {
+//             case 0: // all taps are the same (eighth notes)
+//                 multiplier = 1.0f;
+//                 break;
+//             case 1: // taps 1 and 3 are dotted eighths, taps 2 and 4 are regular eighths
+//                 multiplier = (i % 2 == 0) ? 1.5f : 1.0f;  // alternates between dotted and regular
+//                 break;
+//             case 2: // taps 1 and 3 are triplets, taps 2 and 4 are regular eighths
+//                 multiplier = (i % 2 == 0) ? 1.333333f : 1.0f;  // alternates between triplet and regular
+//                 break;
+//             case 3: // taps are all sixteenth notes
+//                 multiplier = 0.5f;  // half the time of eighth notes
+//                 break;
+//             default:
+//                 multiplier = 1.0f;
+//         }
+//         delay_lines[i].SetDelay(vTime.GetValue() * hw.AudioSampleRate() * multiplier);
+//     }
+// }
+
+inline float read_delay_lines()
+{
+    float delayed = 0;
+
+    for (size_t j = 0; j < 4; j++) {
+        float delay_line = delay_lines[j].Read();
+
+        // Process the lfo filters
+        float mod_amount = line_osc[j].Process();
+        float filter_freq = 12000.0f * powf(0.6f, j);  // Will go from 12kHz down dramatically
+        filter_freq = filter_freq * (1.0f + (mod_amount * 0.1f));
+        biquad_set_frequency(&line_filters[j], filter_freq);
+        float filtered_delay_line = biquad_process(&line_filters[j], delay_line);
+
+        // Mix in the filtered signal based on the mod depth
+        // delay_line = mix_signals(delay_line, filtered_delay_line, vDepth.GetValue());
+        delay_line = filtered_delay_line;
+
+        // Mix each tap with the previous one based on an exponential decay
+        float tap_coeff = powf(0.7f, j);  
+        delayed += delay_line * tap_coeff;
+    }
+
+    return delayed;
+}
+
+inline float apply_pitcher(float signal)
+{
+    float pitched = harmonizer_process(&harmonizer, signal);
+    return (pitched * vDepth.GetValue());
+}
+
+
+void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size) {
+    // biquad_set_frequency(&high_pass, vBass.GetValue());
+    high_pass.SetFreq(vBass.GetValue());
+    low_pass.SetFreq(vTreble.GetValue());
+    // biquad_set_frequency(&low_pass, vTreble.GetValue());
+
+    // UpdateRhythmTime();
+
+    overdrive.SetDrive(0.35f);
+
+    for (size_t i = 0; i < size; i++) {
+        float input = (in[1][i] + in[0][i]) * 0.5f;
+
+        if (true) {
+            input = overdrive.Process(input); // clean boost?
+            out[0][i] = out[1][i] = input;
+            continue;
+        }
+
+        // Read the delayed signal first
+        float wet = read_delay_lines();
+
+        float pitched = input;
+        if (modulation == 0 || modulation == 1) {
+            pitched += apply_pitcher(input);
+        } 
+
+        float overdriven = overdrive.Process(pitched);
+        for (size_t j = 0; j < 4; j++) {
+            float feedback_amt = vFeedback.GetValue() * powf(0.7f, j);
+            delay_lines[j].Write(((overdriven + wet) / 2)* feedback_amt);
+        }
+
+        if (modulation == 2) {
+            wet = mix_signals(wet, vibrato.Process(wet), vDepth.GetValue());
+        } else  if (modulation == 3){
+            wet = mix_signals(wet, chorus.Process(wet), vDepth.GetValue());
+        } 
+
+        high_pass.Process(wet);
+        wet = high_pass.High();
+
+        low_pass.Process(wet);
+        wet = low_pass.Low();
+
+        // Mix filtered signal with delayed signal
+        float mixed = pitched + (wet * vMix.GetValue());
+
+        out[0][i] = out[1][i] = mixed;
+    }
+}
+
+void init_hardware() {
+    hw.Configure();
+    hw.Init();
+    hw.SetAudioBlockSize(48);
+    hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
+}
+
+void init_potentiometers() {
+    AdcChannelConfig adcConfig[6];
+    adcConfig[0].InitSingle(hw.GetPin(POT1));
+    adcConfig[1].InitSingle(hw.GetPin(POT2));
+    adcConfig[2].InitSingle(hw.GetPin(POT3));
+    adcConfig[3].InitSingle(hw.GetPin(POT4));
+    adcConfig[4].InitSingle(hw.GetPin(POT5));
+    adcConfig[5].InitSingle(hw.GetPin(POT6));
+    hw.adc.Init(adcConfig, 6);
+    hw.adc.Start();
+
+    vTime.Init(&hw.adc, 0, 0.0f, 1.0f, LOGARITHMIC);
+    vFeedback.Init(&hw.adc, 1, 0.0f, 1.0f, LOGARITHMIC);
+    vMix.Init(&hw.adc, 2, 0.0f, 1.0f, LOGARITHMIC);
+    vDepth.Init(&hw.adc, 3, 0.0f, 1.0f, LOGARITHMIC);
+    vBass.Init(&hw.adc, 4, 0.0f, 800.0f, LOGARITHMIC);
+    vTreble.Init(&hw.adc, 5, 2000.0f, 20000.0f, LOGARITHMIC);
+}
+
+void init_switches() {
+    s1.Init(hw.GetPin(S1));
+    s2.Init(hw.GetPin(S2));
+    s3.Init(hw.GetPin(S3));
+    s4.Init(hw.GetPin(S4));
+}
+
+void init_buttons() {
+    fs1.Init(hw.GetPin(FS1));
+    tap_tempo.Init(hw.GetPin(FS2));
+
+    bypass_led.Init(hw.GetPin(LED_A), false);
+    tempo_led.Init(hw.GetPin(LED_B), false);
+
+}
+
+void init_effects() {
+    harmonizer_init(&harmonizer, hw.AudioSampleRate());
+    overdrive.Init();
+    
+    vibrato.Init(hw.AudioSampleRate());
+    vibrato.SetDepth(0.2f);
+    vibrato.SetRate(1.0f);
+
+    chorus.Init(hw.AudioSampleRate());
+    chorus.SetLfoDepth(0.2f);
+    chorus.SetLfoFreq(1.0f);
+    
+    high_pass.Init(hw.AudioSampleRate());
+    high_pass.SetFreq(1000);
+    high_pass.SetRes(0.707);
+    high_pass.SetDrive(2);
+    low_pass.Init(hw.AudioSampleRate());
+    low_pass.SetFreq(1000);
+    low_pass.SetRes(0.707);
+    low_pass.SetDrive(2);
+
+
+    for (size_t i = 0; i < 5; i++) {
+        delay_lines[i].Init(48000);
+        delay_lines[i].SetDelay(0.5f * hw.AudioSampleRate());
+        float filter_freq = 12000.0f * powf(0.6f, i);  // Will go from 12kHz down dramatically
+        biquad_init(&line_filters[i], FILTER_LOWPASS, filter_freq, 0.707, 2, hw.AudioSampleRate());
+        line_osc[i].Init(hw.AudioSampleRate());
+        line_osc[i].SetWaveform(Oscillator::WAVE_SIN);
+        line_osc[i].SetFreq(0.1f * (i + 1));
+    }
+}
+
+void update() {
+    bypass_led.Set(1);    
+    tempo_led.Set(1);
+
+    bypass_led.Update();
+    tempo_led.Update();
+
+    delayTimeController.Process();
+    
+    if (delayTimeController.WasUpdated()) {
+        float newDelayTime = delayTimeController.GetDelayTime();
+        // Update all delay lines with the new time
+        for (size_t i = 0; i < 4; i++) {
+            float multiplier = GetRhythmMultiplier(i, rhythm);
+            delay_lines[i].SetDelay(newDelayTime * hw.AudioSampleRate() * multiplier);
+        }
+    }
+
+    vFeedback.Update();
+    vMix.Update();
+    vBass.Update();
+    vDepth.Update();
+    vTreble.Update();
+
+    s1.Debounce();
+    s2.Debounce();
+    s3.Debounce();
+    s4.Debounce();
+
+    bool switchState[4] = {s1.Pressed(), s2.Pressed(), s3.Pressed(), s4.Pressed()};
+    bool fsState = fs1.checkButton();
+
+
+    modulation = switchState[1] | (switchState[0] << 1);
+    if (modulation == 0) {
+        harmonizer_set_harmony(&harmonizer, OCTAVE_UP);
+    } else if (modulation == 1) {
+        harmonizer_set_harmony(&harmonizer, OCTAVE_DOWN);
+    }
+
+    rhythm = switchState[3] | (switchState[2] << 1);
+
+    if (fsState) {
+        isActivated = !isActivated;
+    }
+
+    // // if the vTime was Updated will get the new delay time from that otherwise will get the delay time from the tap tempo if the tap tempo was updated
+    // if (vTime.WasUpdated()) {
+    //     hw.PrintLine("vTime Updated");
+    //     UpdateRhythmTime();
+    // } else if (tap_tempo.WasUpdated()) {
+    //     vTime.SetValue(tap_tempo.GetDelayTime());
+    //     UpdateRhythmTime();
+    // }
+
+    System::Delay(1);
+}
+
+int main(void) {
+    init_hardware();
+    init_potentiometers();
+    init_switches();
+    init_buttons();
+    init_effects();
+    hw.StartLog();
+    hw.StartAudio(AudioCallback);
+
+    while (1) {
+        update();
+    }
+}

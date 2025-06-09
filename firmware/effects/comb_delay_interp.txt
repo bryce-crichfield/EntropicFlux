@@ -1,0 +1,88 @@
+#pragma once
+#include <math.h>
+#include <stdlib.h>
+#include "biquad.h"
+#include "../platform/circular_buffer.h"
+
+typedef struct {
+    circular_buffer_t buffer;
+    biquad_t filter;
+    float feedback_gain;    // feedback amount (how much of the delayed signal to mix with the input)
+    float filtered;        // previous output sample
+    float current_delay_samples;     // delay length in samples
+    float target_delay_samples;     // target delay length in samples
+    float delay_smooth_coeff;       // smoothing coefficient for delay length
+        float prev_output;  // Add this to help smooth transitions
+
+} comb_t;
+
+void comb_init(comb_t *c, size_t sample_rate) {
+    circular_buffer_init(&c->buffer, (size_t)(0.2f * sample_rate));
+    biquad_init(&c->filter, FILTER_LOWPASS, 8000, 0.707f, 1, sample_rate);
+    c->feedback_gain = 0.0f;
+    c->filtered = 0.0f;
+    // c->delay_samples = (int)(0.1f * sample_rate); // 100ms default delay
+    c->current_delay_samples = 0.0f;
+    c->target_delay_samples = 0.0f;
+    c->delay_smooth_coeff = 0.997f;  // Try a slightly different smoothing value
+    c->prev_output = 0.0f;
+}
+
+float comb_process(comb_t *c, float input) {
+    // Smoother delay time interpolation
+    c->current_delay_samples = c->current_delay_samples * c->delay_smooth_coeff + 
+                              c->target_delay_samples * (1.0f - c->delay_smooth_coeff);
+    
+    // Calculate integer and fractional parts
+    int delay_int = (int)floorf(c->current_delay_samples);
+    float frac = c->current_delay_samples - delay_int;
+    
+    // Calculate read positions
+    int current_pos = c->buffer.write_pos;
+    int read_pos = current_pos - delay_int;
+    if(read_pos < 0) read_pos += c->buffer.size;
+    
+    int read_pos_next = read_pos - 1;
+    if(read_pos_next < 0) read_pos_next += c->buffer.size;
+    
+    // Get delayed samples
+    float s1 = circular_buffer_read(&c->buffer, read_pos);
+    float s2 = circular_buffer_read(&c->buffer, read_pos_next);
+    
+    // Cubic interpolation
+    float delayed = s1 + frac * (s2 - s1);
+    
+    // Smooth the output transition
+    delayed = delayed * 0.997f + c->prev_output * 0.003f;
+    c->prev_output = delayed;
+    
+    // Apply filter and feedback
+    float filtered = biquad_process(&c->filter, delayed);
+    circular_buffer_write(&c->buffer, input + (filtered * c->feedback_gain));
+    
+    return delayed;
+}
+
+
+// Set delay time in seconds
+void comb_set_delay(comb_t *c, float delay_time, float sample_rate) {
+    float new_delay = delay_time * sample_rate;
+    
+    // Constrain the delay time
+    if(new_delay >= c->buffer.size - 2) 
+        new_delay = c->buffer.size - 2;
+    if(new_delay < 1) 
+        new_delay = 1;
+        
+    c->target_delay_samples = new_delay;
+}
+
+// Set feedback amount (0 to 1)
+void comb_set_feedback(comb_t *c, float feedback) {
+    c->feedback_gain = feedback;
+}
+
+// Set damping amount (0 to 1)
+void comb_set_damping(comb_t *c, float damping_freq) {
+    biquad_set_frequency(&c->filter, damping_freq);
+}
