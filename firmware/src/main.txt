@@ -35,7 +35,6 @@ DaisySeed hw;
 #define FS1 26
 #define FS2 25
 
-
 DelayTimeController delayTimeController;
 Potentiometer vTime;
 Potentiometer vFeedback;
@@ -69,31 +68,6 @@ Overdrive overdrive;
 inline float mix_signals(float dry, float wet, float mix) {
     return (1.0f - mix) * dry + mix * wet;
 }
-
-// inline void UpdateRhythmTime() 
-// {
-//     // Calculate delay times for each tap based on the set rhythm
-//     for (size_t i = 0; i < 4; i++) {
-//         float multiplier;
-//         switch (rhythm) {
-//             case 0: // all taps are the same (eighth notes)
-//                 multiplier = 1.0f;
-//                 break;
-//             case 1: // taps 1 and 3 are dotted eighths, taps 2 and 4 are regular eighths
-//                 multiplier = (i % 2 == 0) ? 1.5f : 1.0f;  // alternates between dotted and regular
-//                 break;
-//             case 2: // taps 1 and 3 are triplets, taps 2 and 4 are regular eighths
-//                 multiplier = (i % 2 == 0) ? 1.333333f : 1.0f;  // alternates between triplet and regular
-//                 break;
-//             case 3: // taps are all sixteenth notes
-//                 multiplier = 0.5f;  // half the time of eighth notes
-//                 break;
-//             default:
-//                 multiplier = 1.0f;
-//         }
-//         delay_lines[i].SetDelay(vTime.GetValue() * hw.AudioSampleRate() * multiplier);
-//     }
-// }
 
 inline float read_delay_lines()
 {

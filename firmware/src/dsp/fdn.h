@@ -1,7 +1,7 @@
 // #pragma once
 
-// #include <math.h>
-// #include <string.h>
+// #src <math.h>
+// #src <string.h>
 
 // #define FDN_SIZE 8
 // #define MAX_DELAY_SAMPLES 48000  // 1 second at 48kHz
